@@ -186,6 +186,68 @@ namespace SpotifyPlexSync
 
         }
 
+        public async Task InitializeForNavidrome(FullPlaylist spPlaylist, NavidromeSync navidromeSync, SpotifyClient spotify, bool newOnly = false, bool checkSnapshot = true)
+        {
+            Name = _config?["Prefix"] + spPlaylist.Name;
+            Author = spPlaylist.Owner?.DisplayName;
+            NoUpdate = false;
+            VersionIdentifier = spPlaylist.Id + "|" + spPlaylist.SnapshotId;
+            if (checkSnapshot && CheckIfSnapshotAlreadySynced(VersionIdentifier))
+            {
+                _logger?.LogInformation("No change to SpotifyPlaylist: " + Name);
+                NoUpdate = true;
+                return;
+            }
+            if (_config.GetValue<bool>("AddAuthorToTitle") && !string.IsNullOrEmpty(Author))
+            {
+                Name = Name + " by " + Author;
+            }
+
+            if (spPlaylist.Images?.Count > 0)
+                PosterUrl = spPlaylist.Images?[0].Url;
+
+            if (spPlaylist.Description != null)
+            {
+                Description = Regex.Replace(spPlaylist.Description, @"<a\b[^>]+>([^<]*(?:(?!</a)<[^<]*)*)</a>", "$1");
+            }
+
+            try
+            {
+                List<Tuple<int, FullTrack>> items = new List<Tuple<int, FullTrack>>();
+                int order = 0;
+                await foreach (var track in spotify.Paginate(spPlaylist.Tracks!))
+                {
+                    FullTrack? ft = track.Track as FullTrack;
+                    if (ft != null)
+                    {
+                        items.Add(new(order++, ft));
+                    }
+                }
+
+                var options = new ParallelOptions { MaxDegreeOfParallelism = 6 };
+                await Parallel.ForEachAsync(items, options, async (item, token) =>
+                {
+                    if (item != null)
+                    {
+                        try
+                        {
+                            Tracks.Add(await SearchSpotifyTracksInNavidrome(navidromeSync, item.Item2, item.Item1, spPlaylist.Id));
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger?.LogError("Track not found with exception: " + ex.Message);
+                        }
+                    }
+                });
+
+                Tracks.Sort();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError("Playlist init failed: " + ex.Message);
+            }
+        }
+
         private static bool CheckIfSnapshotAlreadySynced(string versionIdentifier)
         {
             var file = "syncedversions.log";
@@ -333,6 +395,37 @@ namespace SpotifyPlexSync
                 }
 
             }
+            return trackresult;
+        }
+
+        private async Task<SyncPlaylistTrack> SearchSpotifyTracksInNavidrome(NavidromeSync navidromeSync, FullTrack spotifyTrack, int sortOrder, string fileId)
+        {
+            SyncPlaylistTrack trackresult = new SyncPlaylistTrack();
+            trackresult.SpTrack = spotifyTrack;
+            trackresult.SortOrder = sortOrder;
+
+            try
+            {
+                var navidromeTrackId = await navidromeSync.SearchForTrack(spotifyTrack);
+                if (!string.IsNullOrEmpty(navidromeTrackId))
+                {
+                    trackresult.PTrackKey = navidromeTrackId;
+                    _logger?.LogInformation("Track found on Navidrome: " + spotifyTrack.Artists[0].Name + " - " + spotifyTrack.Album.Name + " - " + spotifyTrack.Name);
+                }
+                else
+                {
+                    var text = spotifyTrack.Artists[0].Name + " - " + spotifyTrack.Album.Name + " - " + spotifyTrack.Name;
+                    if (_config?.GetValue<bool>("LogUnmatched") ?? false)
+                    {
+                        File.AppendAllLines($"sptfplexsync_unmatched_{fileId}_{DateTime.Now.ToString("yyyy-MM-dd")}.log", new List<string>() { text });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError($"Error searching for track in Navidrome: {ex.Message}");
+            }
+
             return trackresult;
         }
 

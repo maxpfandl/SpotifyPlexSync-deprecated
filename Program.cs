@@ -124,7 +124,9 @@ namespace SpotifyPlexSync
                 {
                     var spotifyPlaylist = await _spotify!.Playlists.Get(playlistId);
                     _logger?.LogInformation("Working on Spotifyplaylist: " + spotifyPlaylist.Name);
-                    var report = await CreateOrUpdatePlexPlayList(spotifyPlaylist, checkSnapshot: bool.Parse(_config!["CheckSpotifySnapshot"]));
+                    var report = _config?.GetValue<string>("SyncTarget")?.ToLower() == "navidrome"
+                        ? await CreateOrUpdateNavidromePlaylist(spotifyPlaylist, checkSnapshot: bool.Parse(_config!["CheckSpotifySnapshot"]))
+                        : await CreateOrUpdatePlexPlayList(spotifyPlaylist, checkSnapshot: bool.Parse(_config!["CheckSpotifySnapshot"]));
                     if (!String.IsNullOrEmpty(report))
                         reports.Add(report);
                 }
@@ -167,7 +169,9 @@ namespace SpotifyPlexSync
                         try
                         {
                             _logger?.LogInformation("Working on Spotifyplaylist: " + playList.Name);
-                            var report = await CreateOrUpdatePlexPlayList(playList, (playlistId == "new" || playlistId == "lidarrnew"), checkSnapshot: bool.Parse(_config!["CheckSpotifySnapshot"]));
+                            var report = _config?.GetValue<string>("SyncTarget")?.ToLower() == "navidrome"
+                                ? await CreateOrUpdateNavidromePlaylist(playList, (playlistId == "new" || playlistId == "lidarrnew"), checkSnapshot: bool.Parse(_config!["CheckSpotifySnapshot"]))
+                                : await CreateOrUpdatePlexPlayList(playList, (playlistId == "new" || playlistId == "lidarrnew"), checkSnapshot: bool.Parse(_config!["CheckSpotifySnapshot"]));
                             if (!String.IsNullOrEmpty(report))
                                 reports.Add(report);
 
@@ -180,9 +184,9 @@ namespace SpotifyPlexSync
                         }
                         catch (Exception ex)
                         {
-                            _logger?.LogError("Syncing with Plex failed", ex);
+                            _logger?.LogError("Syncing failed", ex);
                             reports.Add($"{playList.Name}: Fatal Error");
-                            if (!await CheckPlexRunning())
+                            if (!await CheckServerRunning())
                             {
                                 return;
                             }
@@ -447,6 +451,39 @@ namespace SpotifyPlexSync
             await _server!.Stop();
         }
 
+        private static string GetSyncTarget()
+        {
+            var target = _config?.GetValue<string>("SyncTarget") ?? "Plex";
+            return target.ToLower();
+        }
+
+        private static async Task<bool> CheckServerRunning()
+        {
+            var target = GetSyncTarget();
+
+            if (target == "navidrome")
+            {
+                using (HttpClient client = new HttpClient())
+                {
+                    var sync = new NavidromeSync(_config!, _logger!, client);
+                    return await sync.CheckNavidromeRunning();
+                }
+            }
+            else
+            {
+                using (HttpClient client = new HttpClient())
+                {
+                    var result = await client.GetAsync($"{_config?["Plex:Url"]}/activities?X-Plex-Token={_config?["Plex:Token"]}");
+                    if (!result.IsSuccessStatusCode)
+                    {
+                        _logger?.LogError("Plex seems to be unavailable, exiting");
+                        return false;
+                    }
+                    return true;
+                }
+            }
+        }
+
 
         private static async Task<string> CreateOrUpdatePlexPlayList(FullPlaylist spotifyPl, bool newOnly = false, bool checkSnapshot = true)
         {
@@ -581,6 +618,103 @@ namespace SpotifyPlexSync
                 return report;
             }
 
+        }
+
+        private static async Task<string> CreateOrUpdateNavidromePlaylist(FullPlaylist spotifyPl, bool newOnly = false, bool checkSnapshot = true)
+        {
+            string report = "";
+
+            using (HttpClient client = new HttpClient())
+            {
+                var navidromeSync = new NavidromeSync(_config!, _logger!, client);
+
+                var playList = new SyncPlaylist(_config!, _logger!);
+
+                // Search for tracks in Navidrome
+                await playList.InitializeForNavidrome(spotifyPl, navidromeSync, _spotify!, newOnly, checkSnapshot);
+
+                report = playList.GetReport();
+
+                _logger?.LogInformation(report);
+
+                if (playList.HasFoundTracks)
+                {
+                    var playlistId = await navidromeSync.GetPlaylistId(playList.Name!);
+
+                    // new playlist
+                    if (playlistId == null)
+                    {
+                        playlistId = await navidromeSync.CreatePlaylist(playList.Name!);
+
+                        if (!string.IsNullOrEmpty(playlistId))
+                        {
+                            foreach (var track in playList.Tracks)
+                            {
+                                if (track.PTrackKey != null) // PTrackKey stores Navidrome track ID in this case
+                                {
+                                    _logger?.LogInformation("Adding to Playlist (" + playList.Name + "): " + track.SpTrack?.Artists[0].Name + " - " + track.SpTrack?.Album.Name + " - " + track.SpTrack?.Name);
+                                    await navidromeSync.AddTrackToPlaylist(playlistId, track.PTrackKey);
+                                }
+                            }
+                            report += " | new";
+                        }
+                    }
+                    // existing playlist
+                    else
+                    {
+                        var existingSongIds = await navidromeSync.GetPlaylistSongIds(playlistId);
+
+                        bool recreate = false;
+
+                        foreach (var fromSpotify in playList.Tracks)
+                        {
+                            if (fromSpotify.PTrackKey != null)
+                            {
+                                if (!existingSongIds.Contains(fromSpotify.PTrackKey))
+                                    recreate = true;
+                            }
+                        }
+
+                        foreach (var existingId in existingSongIds)
+                        {
+                            var deleteItem = playList.Tracks.Find(p => p.PTrackKey == existingId);
+                            if (deleteItem == null)
+                                recreate = true;
+                        }
+
+                        if (recreate)
+                        {
+                            await navidromeSync.DeletePlaylist(playlistId);
+
+                            playlistId = await navidromeSync.CreatePlaylist(playList.Name!);
+
+                            if (!string.IsNullOrEmpty(playlistId))
+                            {
+                                foreach (var track in playList.Tracks)
+                                {
+                                    if (track.PTrackKey != null)
+                                    {
+                                        _logger?.LogInformation("Adding to Playlist (" + playList.Name + "): " + track.SpTrack?.Artists[0].Name + " - " + track.SpTrack?.Album.Name + " - " + track.SpTrack?.Name);
+                                        await navidromeSync.AddTrackToPlaylist(playlistId, track.PTrackKey);
+                                    }
+                                }
+                                report += " | recreated";
+                            }
+                        }
+                        else
+                        {
+                            report += " | no change";
+                            _logger?.LogInformation("No change to Playlist: " + playList.Name);
+                        }
+                    }
+                }
+                else
+                {
+                    _logger?.LogError("No Titles found in Navidrome for Playlist " + playList.Name);
+                }
+
+                return report;
+            }
         }
 
 
