@@ -707,6 +707,18 @@ namespace SpotifyPlexSync
                             _logger?.LogInformation("No change to Playlist: " + playList.Name);
                         }
                     }
+
+                    // Update playlist cover and description
+                    if (!string.IsNullOrEmpty(playlistId))
+                    {
+                        await navidromeSync.UpdatePlaylistCover(playlistId, playList.PosterUrl);
+                        if (_config.GetValue<Boolean>("AddReportToDescription"))
+                        {
+                            report += " | " + DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+                            playList.AddToDescription(report);
+                            await navidromeSync.UpdatePlaylistName(playlistId, playList.Name!);
+                        }
+                    }
                 }
                 else
                 {

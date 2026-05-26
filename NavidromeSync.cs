@@ -337,5 +337,42 @@ namespace SpotifyPlexSync
                 return false;
             }
         }
+
+        public async Task<bool> UpdatePlaylistCover(string playlistId, string? posterUrl)
+        {
+            if (string.IsNullOrEmpty(posterUrl))
+                return true;
+
+            try
+            {
+                // Navidrome uses updatePlaylist.view with comment field to store metadata
+                // Since direct cover art upload isn't standard in Subsonic, we store URL in comment
+                var encodedUrl = HttpUtility.UrlEncode(posterUrl);
+                var url = $"{_config?["Navidrome:Url"]}/rest/updatePlaylist.view?playlistId={playlistId}&comment={encodedUrl}&{GetAuthParams()}";
+                var result = await _client.PostAsync(url, null);
+
+                if (!result.IsSuccessStatusCode)
+                {
+                    _logger?.LogWarning($"Could not update playlist cover in Navidrome: {result.ReasonPhrase}");
+                    return false;
+                }
+
+                var content = await result.Content.ReadAsStringAsync();
+                var json = JObject.Parse(content);
+
+                if (json["subsonic-response"]?["status"]?.ToString() == "ok")
+                {
+                    _logger?.LogInformation($"Playlist cover URL stored in Navidrome: {posterUrl}");
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning($"Could not update playlist cover in Navidrome: {ex.Message}");
+                return false;
+            }
+        }
     }
 }
